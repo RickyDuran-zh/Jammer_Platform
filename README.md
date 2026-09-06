@@ -107,7 +107,10 @@ Agent 控制需要 DEEPSEEK_API_KEY；没有密钥时，UI、Mock 后端和 RL �
 
 ~~~text
 Jammer_Platform/
+├─ AGENTS.md                         # 架构与协作开发约束
 ├─ README.md
+├─ scripts/
+│  └─ run_platform.sh                # Git Bash 一键启动器
 ├─ matlab/
 │  ├─ project_setup.m                 # MATLAB 路径初始化
 │  ├─ backend/
@@ -153,7 +156,56 @@ conda activate jammer_rl
 pip install -r C:\Users\503\Desktop\zh_jammer_v4\python\rl_service\requirements.txt
 ~~~
 
-## 快速开始：Mock 全链路
+## Git Bash 一键启动
+
+一键启动器会按 UI（5555）→ RL（6001）→ MATLAB 的顺序自动拉起三进程；MATLAB 后端退出或在终端按 Ctrl+C 后，脚本会终止它启动的其余进程。运行日志写入未纳入版本控制的 logs/ 目录。
+
+在 **Git Bash** 中，从仓库根目录执行：
+
+~~~bash
+bash scripts/run_platform.sh mock
+~~~
+
+上面的命令启动 Mock 全链路，默认使用 PPO。切换算法：
+
+~~~bash
+bash scripts/run_platform.sh mock --algo a2c
+bash scripts/run_platform.sh mock --algo bdq
+~~~
+
+真实 X310 后端默认仍保持禁发，只做硬件初始化、感知、决策、波形生成与遥测：
+
+~~~bash
+bash scripts/run_platform.sh live
+~~~
+
+只有在已授权的屏蔽箱或充分衰减的有线测试环境中，才可显式解除脚本为 MATLAB 后端设置的射频互锁：
+
+~~~bash
+bash scripts/run_platform.sh live --allow-rf --algo ppo
+~~~
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| --algo ppo\|a2c\|bdq | 选择 RL 推理算法。 |
+| --allow-rf | 仅允许与 live 同时使用；为 MATLAB 进程设置 ZH_RF_TX_ENABLE=LAB_ONLY。 |
+| --ui-env 名称 / --rl-env 名称 | 覆盖默认 Conda 环境 jammer_ui / jammer_rl。 |
+| --matlab-bin 路径 / --conda-bin 路径 | 覆盖 MATLAB 或 Conda 可执行文件。 |
+| --no-ui / --no-rl | 调试时不启动对应的 Python 进程。 |
+| --dry-run | 只验证参数并打印启动计划，不启动任何进程。 |
+
+如果 Git Bash 未能从 PATH 找到 MATLAB，可传入 Windows 安装路径：
+
+~~~bash
+MATLAB_BIN='/c/Program Files/MATLAB/R2025a/bin/matlab.exe' \
+  bash scripts/run_platform.sh mock
+~~~
+
+脚本会将当前的 DEEPSEEK_API_KEY 环境变量自动传给 UI 进程；无需把密钥写入脚本或仓库。
+
+## 手动启动：Mock 全链路
 
 Mock 是首次运行与演示的推荐方式，不会连接或发射 USRP。
 

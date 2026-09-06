@@ -1,0 +1,19 @@
+function radio_rx = radio_rx_init(cfg)
+% Build the receiver separately so it can be recovered without rebuilding TX.
+
+radio_rx = comm.SDRuReceiver( ...
+    'Platform', 'X310', ...
+    'IPAddress', cfg.ip_addr, ...
+    'OutputDataType', 'double', ...
+    'MasterClockRate', cfg.MasterClockRate, ...
+    'DecimationFactor', cfg.InterpolationFactor, ...
+    'SamplesPerFrame', cfg.sample_num);
+
+radio_rx.CenterFrequency = cfg.center_freq;
+radio_rx.Gain = cfg.rx_gain;
+radio_rx.ChannelMapping = 1;
+radio_rx.ClockSource = 'Internal';
+if isprop(radio_rx, 'Antenna')
+    radio_rx.Antenna = cfg.rx_antenna;
+end
+end

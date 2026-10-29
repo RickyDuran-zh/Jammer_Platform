@@ -2,14 +2,10 @@
 Strategy engine for the AI agent — generates jamming actions frame-by-frame
 based on an active strategy and real-time telemetry data.
 
-Strategies:
-  fixed       — hold constant parameters
-  sweep       — cycle through all channels sequentially
-  track_busy  — always target the channel with highest occupancy
-  track_weak  — always target the channel with lowest SNR-like metric
-  alternating — alternate between N channels
-  reactive    — auto-switch waveform mode based on SNR
+Tactics select a sequence of four-field actions; MATLAB executes each action.
+The tactic is separate from waveform_mode (noise or multi-tone).
 """
+import random
 import threading
 from typing import Optional
 
@@ -55,9 +51,11 @@ class SweepStrategy(_BaseStrategy):
         self.waveform_mode = int(waveform_mode)
         self._idx = 0
         self._frame = 0
+        self.last_channel = self.channels[0]
 
     def tick(self, **kwargs):
         ch = self.channels[self._idx % len(self.channels)]
+        self.last_channel = ch
         self._frame += 1
         if self._frame >= self.dwell_frames:
             self._frame = 0
@@ -72,6 +70,41 @@ class SweepStrategy(_BaseStrategy):
     @property
     def current_channel(self):
         return self.channels[self._idx % len(self.channels)]
+
+
+class RandomStrategy(_BaseStrategy):
+    """Random channel hopping with a fixed dwell and no immediate repeat."""
+
+    def __init__(self, channels=None, start_channel=0, dwell_frames=25,
+                 power_db=10.0, bw_mhz=4, waveform_mode=0):
+        self.channels = list(dict.fromkeys(
+            channels if channels is not None else range(10)))
+        if len(self.channels) < 2:
+            raise ValueError("随机跳频至少需要两个不同信道")
+        self.dwell_frames = max(1, int(dwell_frames))
+        self.power_db = float(power_db)
+        self.bw_mhz = int(bw_mhz)
+        self.waveform_mode = int(waveform_mode)
+        self.current_channel = (int(start_channel) if start_channel in self.channels
+                                else self.channels[0])
+        self.last_channel = self.current_channel
+        self._frame = 0
+
+    def tick(self, **kwargs):
+        action = {
+            "channel_idx": self.current_channel,
+            "power_db": self.power_db,
+            "bw_mhz": self.bw_mhz,
+            "waveform_mode": self.waveform_mode,
+        }
+        self.last_channel = self.current_channel
+        self._frame += 1
+        if self._frame >= self.dwell_frames:
+            self._frame = 0
+            choices = [ch for ch in self.channels if ch != self.current_channel]
+            if choices:
+                self.current_channel = random.choice(choices)
+        return action
 
 
 # ── Track Busiest ───────────────────────────────────────────────────
@@ -103,6 +136,35 @@ class TrackBusiestStrategy(_BaseStrategy):
             "bw_mhz": self.bw_mhz,
             "waveform_mode": self.waveform_mode,
         }
+
+
+class TargetTrackingStrategy(TrackBusiestStrategy):
+    """Follow the most occupied observed channel with switch hysteresis.
+
+    The first channel feature is occupancy. If no channel passes the threshold,
+    hold the previous target. A small margin avoids switching on noise alone.
+    """
+
+    def __init__(self, channel_idx=0, power_db=10.0, bw_mhz=4,
+                 waveform_mode=0, min_occupancy=0.15, switch_margin=0.05):
+        super().__init__(power_db=power_db, bw_mhz=bw_mhz,
+                         waveform_mode=waveform_mode, min_occupancy=min_occupancy)
+        self.current_channel = int(channel_idx)
+        self.switch_margin = float(switch_margin)
+
+    def tick(self, channel_features=None, **kwargs):
+        if not channel_features:
+            return self._action(self.current_channel)
+        occupied = [float(row[0]) if row else 0.0 for row in channel_features]
+        best_ch = max(range(len(occupied)), key=occupied.__getitem__)
+        if self.current_channel >= len(occupied):
+            self.current_channel = best_ch
+        current_occ = occupied[self.current_channel]
+        if (occupied[best_ch] >= self.min_occupancy and
+                (current_occ < self.min_occupancy or
+                 occupied[best_ch] >= current_occ + self.switch_margin)):
+            self.current_channel = best_ch
+        return self._action(self.current_channel)
 
 
 # ── Track Weakest (lowest SNR-like) ─────────────────────────────────
@@ -188,15 +250,116 @@ class ReactiveStrategy(_BaseStrategy):
         }
 
 
+# ── Coerce (强制型) ────────────────────────────────────────────────
+
+class CoerceStrategy(TrackBusiestStrategy):
+    """Aggressive profile: favor occupied channels and higher gain/bandwidth."""
+
+    def __init__(self, power_db=20.0, bw_mhz=8, waveform_mode=0, min_occupancy=0.10):
+        super().__init__(power_db=power_db, bw_mhz=bw_mhz,
+                         waveform_mode=waveform_mode, min_occupancy=min_occupancy)
+
+    def tick(self, channel_features=None, rl_action=None, **kwargs):
+        action = super().tick(channel_features=channel_features)
+        if rl_action:
+            action["channel_idx"] = int(rl_action["channel_idx"])
+            action["power_db"] = min(self.power_db, max(self.power_db * 0.75,
+                                                         float(rl_action["power_db"])))
+            action["bw_mhz"] = min(self.bw_mhz, max(4, int(rl_action["bw_mhz"])))
+        return action
+
+
+# ── Energy Save (能量节约型) ───────────────────────────────────────
+
+class EnergySaveStrategy(_BaseStrategy):
+    """Low gain/narrow band profile; no occupancy requests minimum gain.
+
+    The current action contract has no TX-off action. Even at zero gain the
+    hardware still transmits when its independent RF interlock is enabled.
+    """
+
+    def __init__(self, power_db=5.0, bw_mhz=2, waveform_mode=0, min_occupancy=0.25):
+        self.power_db = float(power_db)
+        self.bw_mhz = int(bw_mhz)
+        self.waveform_mode = int(waveform_mode)
+        self.min_occupancy = float(min_occupancy)
+        self.current_channel = 0
+
+    def tick(self, channel_features=None, rl_action=None, **kwargs):
+        if not channel_features:
+            return {"channel_idx": 0, "power_db": 0,
+                    "bw_mhz": self.bw_mhz, "waveform_mode": self.waveform_mode}
+        best_ch = max(
+            range(len(channel_features)),
+            key=lambda i: float(channel_features[i][0]) if len(channel_features[i]) > 0 else 0,
+        )
+        if rl_action:
+            proposed_ch = int(rl_action["channel_idx"])
+            if 0 <= proposed_ch < len(channel_features) and \
+                    float(channel_features[proposed_ch][0]) >= self.min_occupancy:
+                best_ch = proposed_ch
+        occ = float(channel_features[best_ch][0]) if len(channel_features[best_ch]) > 0 else 0
+        power = 0 if occ < self.min_occupancy else self.power_db
+        if rl_action and occ >= self.min_occupancy:
+            power = min(self.power_db, float(rl_action["power_db"]))
+        self.current_channel = best_ch
+        return {
+            "channel_idx": best_ch,
+            "power_db": power,
+            "bw_mhz": min(self.bw_mhz, int(rl_action["bw_mhz"])) if rl_action else self.bw_mhz,
+            "waveform_mode": int(rl_action["waveform_mode"]) if rl_action else self.waveform_mode,
+        }
+
+
+# ── Deception (欺骗诱导型) ─────────────────────────────────────────
+
+class DeceptionStrategy(TrackBusiestStrategy):
+    """Prototype profile with changing channel/waveform choices.
+
+    This is a rule approximation, not the paper's learned mode-transition
+    policy or a demonstrated deception effect.
+    """
+
+    def __init__(self, power_db=12.0, bw_mhz=4, waveform_mode=1, min_occupancy=0.10):
+        super().__init__(power_db=power_db, bw_mhz=bw_mhz,
+                         waveform_mode=waveform_mode, min_occupancy=min_occupancy)
+        self._step = 0
+
+    def tick(self, channel_features=None, rl_action=None, **kwargs):
+        action = super().tick(channel_features=channel_features)
+        self._step += 1
+        if rl_action:
+            action["channel_idx"] = int(rl_action["channel_idx"])
+            action["power_db"] = max(0, min(20, self.power_db +
+                                            (float(rl_action["power_db"]) - 10) * 0.25))
+            action["bw_mhz"] = int(rl_action["bw_mhz"])
+        # Pattern varies the available waveform, not an additional RF mode.
+        if self._step % 7 in (2, 5):
+            action["waveform_mode"] = 1 - self.waveform_mode
+        return action
+
+
 # ── Engine ──────────────────────────────────────────────────────────
+
+# 三种预设策略的默认参数（UI 控制策略候选框与策略类共用的单一事实来源）
+PRESET_STRATEGIES = {
+    "coerce": {"power_db": 20, "bw_mhz": 8, "waveform_mode": 0, "min_occupancy": 0.10},
+    "energy_save": {"power_db": 5, "bw_mhz": 2, "waveform_mode": 0, "min_occupancy": 0.25},
+    "deception": {"power_db": 12, "bw_mhz": 4, "waveform_mode": 1, "min_occupancy": 0.10},
+}
 
 STRATEGY_REGISTRY = {
     "fixed": FixedStrategy,
     "sweep": SweepStrategy,
+    "random": RandomStrategy,
+    "target_track": TargetTrackingStrategy,
     "track_busiest": TrackBusiestStrategy,
     "track_weakest": TrackWeakestStrategy,
     "alternating": AlternatingStrategy,
     "reactive": ReactiveStrategy,
+    "coerce": CoerceStrategy,
+    "energy_save": EnergySaveStrategy,
+    "deception": DeceptionStrategy,
 }
 
 
@@ -244,7 +407,7 @@ class StrategyEngine:
             self._active = False
 
     def tick(self, channel_features=None, channel_map=None,
-             snr=0.0, bw_est=0.0) -> dict | None:
+             snr=0.0, bw_est=0.0, rl_action=None) -> dict | None:
         """Called each telemetry frame. Returns action dict or None."""
         with self._lock:
             if not self._active or not self._strategy:
@@ -254,4 +417,5 @@ class StrategyEngine:
                 channel_map=channel_map,
                 snr=snr,
                 bw_est=bw_est,
+                rl_action=rl_action,
             )

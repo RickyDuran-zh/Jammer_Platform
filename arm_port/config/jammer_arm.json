@@ -1,0 +1,70 @@
+{
+  "_readme": [
+    "Site configuration for the RK3588 jammer backend (arm_port).",
+    "Every key is optional: defaults live in python/jammer_arm/config.py, which mirrors",
+    "matlab/backend/jammer_config.m. Only list what differs on this deployment.",
+    "Keys starting with '_' are comments and are ignored.",
+    "RF transparent transmission CANNOT be enabled from this file. Only the process",
+    "environment variable ZH_RF_TX_ENABLE=LAB_ONLY arms TX, and only in an authorized",
+    "shielded box or a sufficiently attenuated cabled setup.",
+    "power_db=0 means minimum TX gain, not 'off'."
+  ],
+  "radio": {
+    "device_args": "type=x300,addr=192.168.10.2,master_clock_rate=200e6",
+    "center_freq_hz": 3000000000.0,
+    "master_clock_rate_hz": 200000000.0,
+    "sample_rate_hz": 20000000.0,
+    "num_samples": 4096,
+    "rx_antenna": "TX/RX",
+    "tx_antenna": "TX/RX",
+    "rx_gain_db": 15.0,
+    "tx_gain_base_db": 0.0,
+    "tx_gain_min_db": 0.0,
+    "tx_gain_max_db": 10.0,
+    "tx_baseband_peak": 0.25,
+    "clock_source": "internal",
+    "settle_sec": 0.5,
+    "recv_timeout_sec": 1.0,
+    "tx_repeat": 1,
+    "tdm": true
+  },
+  "_radio_notes": [
+    "192.168.10.2 is the X310 default address. On a 1 GbE link 20 MS/s is close to",
+    "the practical ceiling; if uhd_usrp_probe reports overruns, lower",
+    "sample_rate_hz/master_clock_rate or move the X310 to the 10 GbE SFP+ port.",
+    "tdm=true stops the RX stream while a TX burst is on air (shared TX/RX port)."
+  ],
+  "spectrum": {
+    "total_span_hz": 20000000.0,
+    "num_channels": 10,
+    "channel_width_hz": 2000000.0
+  },
+  "actions": {
+    "power_levels_db": [0.0, 5.0, 10.0, 15.0, 20.0],
+    "power_db_min": 0.0,
+    "power_db_max": 20.0,
+    "bw_choices_mhz": [2, 4, 6, 8],
+    "waveform_modes": [0, 1],
+    "power_to_gain": 0.5
+  },
+  "network": {
+    "host": "127.0.0.1",
+    "rl_port": 6001,
+    "rl_timeout_sec": 2.0,
+    "telemetry_port": 5555,
+    "telemetry_timeout_sec": 1.0,
+    "command_port": 5557,
+    "command_timeout_sec": 1.0,
+    "reconnect_backoff_sec": 1.0,
+    "session_id": "jammer_spectrum_ctrl_single_usrp"
+  },
+  "loop": {
+    "frame_period_sec": 0.08,
+    "mock_frame_period_sec": 0.12,
+    "rx_timeout_reinit_threshold": 3,
+    "rx_reinit_pause_sec": 0.2,
+    "full_radio_reinit_threshold": 2,
+    "status_write_interval_sec": 1.0
+  },
+  "emit_hw_actuals": true
+}

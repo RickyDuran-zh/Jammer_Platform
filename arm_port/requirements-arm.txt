@@ -1,0 +1,11 @@
+# Runtime dependencies of the ARM jammer backend (python/jammer_arm).
+#
+# Deliberately minimal: numpy is the only hard third-party requirement.  scipy,
+# torch, PyQt5 and pyqtgraph are NOT needed by the backend - the RL service keeps
+# its own environment (python/rl_service/requirements.txt) and the UI its own
+# (python/app/requirements.txt), exactly as before.
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-arm.txt
+#
+# aarch64 wheels for numpy are published on PyPI; no build toolchain required.
+numpy>=1.24

@@ -1,0 +1,3 @@
+# Only for running the test suite (python -m unittest needs nothing extra, but
+# these make life easier on a workstation).
+numpy>=1.24

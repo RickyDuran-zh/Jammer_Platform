@@ -3,15 +3,18 @@ PyQt5 chat panel widget for interacting with the AI agent.
 """
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from .key_dialog import APIKeyDialog
+
 MAX_BLOCKS = 500  # trim messages when exceeding this many text blocks
 
 
 class AgentPanel(QtWidgets.QWidget):
-    """Chat panel with message display, loading animation, and quick commands."""
+    """Assistant pane: strategy control on top, chat and analysis below."""
 
     send_message = QtCore.pyqtSignal(str)
     clear_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
+    api_key_changed = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,19 +42,41 @@ class AgentPanel(QtWidgets.QWidget):
         header.addStretch()
         header.addWidget(self.status_label)
 
+        self.key_btn = QtWidgets.QPushButton("密钥")
+        self.key_btn.setObjectName("AgentClearBtn")
+        self.key_btn.setFixedWidth(46)
+        self.key_btn.setToolTip("把 DeepSeek 密钥保存到 Windows 凭据管理器")
+        self.key_btn.clicked.connect(self._on_edit_key)
+        header.addWidget(self.key_btn)
+
         new_chat_btn = QtWidgets.QPushButton("新对话")
         new_chat_btn.setObjectName("AgentClearBtn")
-        new_chat_btn.setFixedWidth(60)
+        new_chat_btn.setFixedWidth(58)
         new_chat_btn.clicked.connect(self._on_new_chat)
         header.addWidget(new_chat_btn)
 
         clear_btn = QtWidgets.QPushButton("清屏")
         clear_btn.setObjectName("AgentClearBtn")
-        clear_btn.setFixedWidth(50)
+        clear_btn.setFixedWidth(46)
         clear_btn.clicked.connect(self._on_clear_screen)
         header.addWidget(clear_btn)
 
+        self.control_toggle_btn = QtWidgets.QPushButton("收起")
+        self.control_toggle_btn.setObjectName("AgentClearBtn")
+        self.control_toggle_btn.setFixedWidth(48)
+        self.control_toggle_btn.setToolTip("收起或展开控制策略卡片")
+        self.control_toggle_btn.setCheckable(True)
+        self.control_toggle_btn.clicked.connect(self._on_toggle_control)
+        header.addWidget(self.control_toggle_btn)
+
         layout.addLayout(header)
+
+        # ── Strategy control card (supplied by MainWindow) ─────
+        self.control_host = QtWidgets.QWidget()
+        self.control_host_layout = QtWidgets.QVBoxLayout(self.control_host)
+        self.control_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.control_host_layout.setSpacing(0)
+        layout.addWidget(self.control_host)
 
         # ── Message area ───────────────────────────────────────
         self.message_area = QtWidgets.QTextEdit()
@@ -65,12 +90,6 @@ class AgentPanel(QtWidgets.QWidget):
         self.quick_cmds_layout.setSpacing(4)
         self.quick_cmd_btns: list[QtWidgets.QPushButton] = []
         layout.addLayout(self.quick_cmds_layout)
-
-        # Second row for control commands
-        self.control_cmds_layout = QtWidgets.QHBoxLayout()
-        self.control_cmds_layout.setSpacing(4)
-        self.control_cmd_btns: list[QtWidgets.QPushButton] = []
-        layout.addLayout(self.control_cmds_layout)
 
         self._refresh_quick_commands()
 
@@ -101,12 +120,32 @@ class AgentPanel(QtWidgets.QWidget):
 
     # ── Public API ─────────────────────────────────────────────
 
+    def set_control_widget(self, widget: QtWidgets.QWidget):
+        self.control_host_layout.addWidget(widget)
+
     def set_control_mode(self, mode: str):
         """Switch quick command buttons based on control mode."""
         if self._control_mode == mode:
             return  # already in this mode, avoid redundant refresh
         self._control_mode = mode
         self._refresh_quick_commands()
+
+    def set_control_collapsed(self, collapsed: bool):
+        self.control_toggle_btn.setChecked(collapsed)
+        self._on_toggle_control(collapsed)
+
+    # ── Control card collapse ──────────────────────────────────
+
+    def _on_toggle_control(self, checked: bool):
+        self.control_host.setVisible(not checked)
+        self.control_toggle_btn.setText("展开" if checked else "收起")
+
+    # ── API key ────────────────────────────────────────────────
+
+    def _on_edit_key(self):
+        dialog = APIKeyDialog(self)
+        dialog.key_changed.connect(self.api_key_changed.emit)
+        dialog.exec_()
 
     # ── Quick commands ──────────────────────────────────────────
 
@@ -118,23 +157,10 @@ class AgentPanel(QtWidgets.QWidget):
             btn.deleteLater()
         self.quick_cmd_btns.clear()
         self.quick_cmds_layout.activate()
-        for btn in self.control_cmd_btns:
-            btn.hide()
-            self.control_cmds_layout.removeWidget(btn)
-            btn.deleteLater()
-        self.control_cmd_btns.clear()
-        self.control_cmds_layout.activate()
-
         if self._control_mode == "agent":
             analysis = [
                 ("频谱分析", "分析当前频谱态势"),
                 ("趋势评估", "分析最近的趋势变化"),
-            ]
-            control = [
-                ("固定当前", "固定干扰当前信道"),
-                ("追踪最强", "切换到Agent控制，追踪占用度最高的信道"),
-                ("信道扫描", "切换到Agent控制，扫描所有信道"),
-                ("交还RL", "取消策略，切换回RL自动控制"),
             ]
         else:
             analysis = [
@@ -142,25 +168,14 @@ class AgentPanel(QtWidgets.QWidget):
                 ("趋势评估", "分析最近的趋势变化"),
                 ("信道状态", "查看各信道状态分布"),
             ]
-            control = [
-                ("接管控制", "切换到Agent控制模式，固定干扰当前信道"),
-                ("信道扫描", "切换到Agent控制，扫描所有信道，每个信道停留2秒"),
-                ("追踪最强", "切换到Agent控制，追踪占用度最高的信道"),
-            ]
 
         for label, cmd in analysis:
             btn = self._make_qcmd(label, cmd)
             self.quick_cmds_layout.addWidget(btn)
             self.quick_cmd_btns.append(btn)
 
-        for label, cmd in control:
-            btn = self._make_qcmd(label, cmd)
-            self.control_cmds_layout.addWidget(btn)
-            self.control_cmd_btns.append(btn)
-
         # Force immediate layout recalculation
         self.quick_cmds_layout.activate()
-        self.control_cmds_layout.activate()
 
     def _make_qcmd(self, label: str, cmd: str):
         btn = QtWidgets.QPushButton(label)
@@ -259,9 +274,11 @@ class AgentPanel(QtWidgets.QWidget):
         if connected:
             self.status_label.setText("已连接")
             self.status_label.setStyleSheet("color: #6ee7b7;")
+            self.key_btn.setToolTip("密钥已配置，点击可更换或清除")
         else:
-            self.status_label.setText("未连接")
+            self.status_label.setText("未配置密钥")
             self.status_label.setStyleSheet("color: #ff5c73;")
+            self.key_btn.setToolTip("点击保存 DeepSeek 密钥后即可使用自然语言交互")
 
     # ── Message formatting ─────────────────────────────────────
 

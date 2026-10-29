@@ -13,15 +13,19 @@
 | MATLAB 后端 | matlab/backend/run_mock_backend_spectrum_control.m 或 matlab/backend/run_jammer_backend.m | Mock/真实感知、动作执行、波形生成、TX 与遥测。 |
 | Python RL 服务 | python/rl_service/rl_server.py | 基于信道特征与上一动作进行 PPO、A2C 或 BDQ 推理。 |
 | Python UI 与 Agent | python/app/main_window.py | 监控显示、遥测处理、命令队列、Agent 工具和策略编排。 |
+| ARM 后端（可选替代） | arm_port/python/jammer_arm/cli.py | 在 RK3588 上以纯 Python 替代 MATLAB 后端：UHD 收发、感知、波形、TX 与遥测。 |
 
 传输接口约定：
 
-- MATLAB ↔ RL 使用 127.0.0.1:6001 上的 JSON Lines：state_req / action_rsp。
+- MATLAB（rl 模式）或 UI Agent（三种预设接管模式）↔ RL 使用 127.0.0.1:6001 上的 JSON Lines：state_req / action_rsp。Agent 预设通过 UI 后台请求 RL 候选动作并施加类型约束；服务不可用时使用规则回退。
 - MATLAB → UI 使用 127.0.0.1:5555 上的 JSON Lines：telemetry。
 - MATLAB 轮询 UI 的 127.0.0.1:5557：cmd_poll / cmd_rsp。
 - 通用动作字段为：channel_idx（0–9）、power_db（0–20）、bw_mhz（2/4/6/8）、waveform_mode（0=带限噪声，1=多音）。
+- 控制权分为 rl（MATLAB 直连 RL）、agent（UI/Agent 逐帧动作或一次性动作）与 UI 手动输入（通过 agent 后端模式执行）；切换控制权时不得重放旧队列动作。三种 Agent 预设是当前 PPO/A2C/BDQ 单策略上的类型约束原型，不得宣称已实现论文中的类型条件化博弈训练或蓝方闭环。
 
-动作结构、端口、JSON-Line 分帧以及 10 信道配置，必须在 MATLAB、UI、Agent 工具、RL 编码器、环境、训练脚本和 README 中保持一致；不得只修改其中一端。
+动作结构、端口、JSON-Line 分帧以及 10 信道配置，必须在 MATLAB、UI、Agent 工具、RL 编码器、环境、训练脚本、ARM 后端（`arm_port/`）和 README 中保持一致；不得只修改其中一端。
+
+MATLAB 后端与 ARM 后端是**互斥的两个实现**，不得同时启动（会争用 5555/5557/6001）。两者对 UI 与 RL 表现为同一个对端：同样的端口、同样的报文、同样的四元动作、同一条 `ZH_RF_TX_ENABLE=LAB_ONLY` 互锁。
 
 ## 运行与射频约束
 
@@ -30,7 +34,8 @@
 - 硬件 TX 默认禁用。只有在取得授权的屏蔽环境或充分衰减的有线测试环境中，才能通过 ZH_RF_TX_ENABLE=LAB_ONLY 解除互锁。
 - 不得在代码或启动工具中弱化、移除、绕过或静默设置 TX 互锁。
 - power_db=0 表示最小 TX 增益，不表示关闭射频发射。
-- 不得提交 API 密钥、凭据、.env 文件、遥测采集数据、生成缓存、日志或未经审查的模型产物。
+- 能量节约型预设不能把“不更新动作”当作停止发射；没有显式 TX-off 动作时只能描述为降低请求增益/带宽。
+- 不得提交 API 密钥、凭据、.env 文件、遥测采集数据、生成缓存、日志或未经审查的模型产物。密钥统一通过 python/app/agent/secret_store.py 存入当前 Windows 用户的凭据管理器（ZHJammerV4/DeepSeekAPI），不得硬编码到源码、脚本或 UI 默认值里；环境变量 DEEPSEEK_API_KEY 仅作为可选覆盖。
 
 ## 开发与验证流程
 
@@ -45,6 +50,16 @@
 任何新增模块或功能，只要改变了架构、进程归属、数据流、端口、动作结构、射频配置、运行模式、启动/开发流程或安全行为，**必须在同一次变更中更新 README.md**。README 必须反映当前实际系统，不能保留过时设计或仅描述计划方案。
 
 项目级开发约束或架构契约发生变化时，也必须同步更新本 AGENTS.md。
+
+## ARM 移植子项目（arm_port/）的额外约束
+
+- `arm_port/python/jammer_arm/config.py` 是 ARM 侧的**唯一配置源**，对应 `matlab/backend/jammer_config.m`；两侧默认值必须保持等价，由 `arm_port/tests/test_equivalence.py` 校验。
+- 射频互锁只能由环境变量 `ZH_RF_TX_ENABLE=LAB_ONLY` 武装。不得让配置文件、命令行参数、systemd 单元或脚本默认值具备开锁能力；`safety` 段与 `tx_enabled` 等键必须继续被 `JammerConfig` 拒绝。
+- 感知（`dsp/sensing.py`）与波形（`dsp/waveform.py`）是**数值契约**：任何修改都会改变 RL 输入分布或干扰效果。修改后必须重新运行 `arm_port/tests/test_equivalence.py`；若参考向量缺失，先用 `arm_port/tools/matlab_reference/dump_reference.m` 重新导出并说明变更理由。
+- 帧循环的容错语义（RX 超时计数 → 重建接收 → 重建整链 → 缓存感知兜底；单帧异常不终止循环）不得简化或删除。
+- 收流必须保持定长突发（`STREAM_MODE_NUM_SAMPS_AND_DONE`）作为默认；改成连续流会让 12.5 fps 的帧循环在 20 MS/s 下必然溢出。`rx_mode=continuous` 仅用于消费速率高于采样率的实验，且需在 README 中说明。
+- 变更 ARM 后端的运行方式、端口、动作结构、射频参数、部署步骤或安全行为时，必须同步更新 `arm_port/README.md` 与相关 `arm_port/docs/*.md`，以及本文件。
+- 不得把板端 IP、密钥、遥测采集数据、IQ 抓取或 `.venv/` 提交进仓库；`arm_port/.venv/` 与构建产物已在 `.gitignore` 中忽略。
 
 ## 变更边界
 

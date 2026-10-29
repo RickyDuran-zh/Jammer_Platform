@@ -28,6 +28,7 @@ class AgentBrain:
             "analyze_current_situation": self.tools.handle_analyze_situation,
             "switch_control_mode": self.tools.handle_switch_control_mode,
             "execute_strategy": self.tools.handle_execute_strategy,
+            "call_rl_inference": self.tools.handle_call_rl_inference,
             "cancel_strategy": self.tools.handle_cancel_strategy,
         }
         for tool_def in ALL_TOOL_DEFS:

@@ -1,6 +1,7 @@
 import os
 import sys
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import numpy as np
@@ -10,7 +11,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from telemetry_server import TelemetryServer
 from agent.agent_brain import AgentBrain
 from agent.agent_panel import AgentPanel
-from agent.strategy_engine import StrategyEngine
+from agent.rl_client import request_rl_action
+from agent.secret_store import read_api_key
+from agent.strategy_engine import PRESET_STRATEGIES, StrategyEngine
 from command_bridge import CommandBridge
 
 
@@ -34,7 +37,7 @@ class LogWidget(QtWidgets.QTableWidget):
     def __init__(self):
         super().__init__(0, 8)
         self.setHorizontalHeaderLabels(
-            ["时间", "序号", "目标信道", "功率(dB)", "带宽(MHz)", "模式", "策略", "状态"]
+            ["时间", "序号", "目标信道", "功率(dB)", "带宽(MHz)", "波形", "决策来源", "状态"]
         )
         self.horizontalHeader().setStretchLastSection(True)
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
@@ -56,6 +59,7 @@ class LogWidget(QtWidgets.QTableWidget):
 
 class MainWindow(QtWidgets.QMainWindow):
     packet_received = QtCore.pyqtSignal(dict)
+    preset_decision_ready = QtCore.pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -73,9 +77,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.power_history = deque([0.0] * self.max_history, maxlen=self.max_history)
 
         # ── Agent (API key comes from the environment; init in main thread) ─
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
         self._agent_init_error: str | None = None
         try:
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip() or read_api_key()
             self.agent_brain = AgentBrain(api_key=api_key)
         except Exception as e:
             import traceback
@@ -85,12 +89,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Strategy engine ────────────────────────────────────
         self.strategy_engine = StrategyEngine()
         self._agent_control_mode = "rl"  # "rl" or "agent"
+        self._manual_mode = False  # manual parameter entry active
+        self._manual_dirty = False  # manual parameters edited but not applied
         self._rl_connected = False  # inferred from telemetry rl_meta
         self._frame_count = 0  # telemetry frame counter for diagnostics
+        self._last_sensing = {}
+        self._last_action = {}
+        self._preset_source = "等待遥测"
+        self._decision_generation = 0
+        self._decision_pending = False
+        self._closing = False
+        self._decision_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="preset-rl")
+        self.preset_decision_ready.connect(self._on_preset_decision)
 
         # ── Command bridge ─────────────────────────────────────
         self.cmd_bridge = CommandBridge("127.0.0.1", 5557)
         self.cmd_bridge.start()
+        self.cmd_bridge.enqueue_control_mode("rl")
 
         # ── Wire agent callbacks ───────────────────────────────
         # CRITICAL: Callbacks run in AgentWorker's bg thread (via LLM tool
@@ -181,23 +196,255 @@ class MainWindow(QtWidgets.QMainWindow):
         header.addWidget(self.mode_badge)
         left_layout.addLayout(header)
 
+        # ── Strategy control card (rendered inside the right assistant pane) ─
+        self.control_panel = QtWidgets.QWidget()
+        self.control_panel.setObjectName("ControlPanel")
+        control_layout = QtWidgets.QVBoxLayout(self.control_panel)
+        control_layout.setContentsMargins(10, 8, 10, 8)
+        control_layout.setSpacing(6)
+
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(6)
+        selector_label = QtWidgets.QLabel("控制策略")
+        selector_label.setObjectName("ControlLabel")
+        head.addWidget(selector_label)
+        self.control_state_label = QtWidgets.QLabel("RL 自动")
+        self.control_state_label.setObjectName("ControlState")
+        self.control_state_label.setAlignment(
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        head.addStretch(1)
+        head.addWidget(self.control_state_label)
+        control_layout.addLayout(head)
+
+        # Candidate boxes: one click switches ownership, no dropdown needed.
+        self.strategy_button_group = QtWidgets.QButtonGroup(self)
+        self.strategy_button_group.setExclusive(True)
+        self.strategy_buttons = {}
+
+        def add_choice_row(label_text, items):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            row_label = QtWidgets.QLabel(label_text)
+            row_label.setObjectName("ControlSubLabel")
+            row_label.setFixedWidth(52)
+            row.addWidget(row_label)
+            for label, key, hint in items:
+                button = QtWidgets.QPushButton(label)
+                button.setObjectName("StrategyChoice")
+                button.setCheckable(True)
+                button.setToolTip(hint)
+                button.setMinimumHeight(28)
+                button.clicked.connect(
+                    lambda _checked, selected=key: self._on_strategy_choice(selected))
+                self.strategy_button_group.addButton(button)
+                self.strategy_buttons[key] = button
+                row.addWidget(button, stretch=1)
+            control_layout.addLayout(row)
+
+        # Who owns the control loop right now.
+        add_choice_row("控制方式", [
+            ("RL 自动", "rl", "MATLAB 逐帧直连 RL 服务"),
+            ("手动控制", "manual", "自由选择信道、功率、带宽与干扰模式"),
+            ("聊天策略", "custom", "由聊天工具启动的规则策略"),
+        ])
+        # The three Agent preset types, side by side for direct comparison.
+        add_choice_row("策略类型", [
+            ("强制型", "coerce", "Agent 接管：偏高增益和带宽"),
+            ("能量节约型", "energy_save", "Agent 接管：限制增益和带宽"),
+            ("欺骗诱导型", "deception", "Agent 接管：实验性波形变化"),
+        ])
+        self.strategy_buttons["rl"].setChecked(True)
+        self.strategy_buttons["custom"].setEnabled(False)
+
+        self.control_hint = QtWidgets.QLabel(
+            "预设逐帧调用 RL 服务并施加类型约束；服务不可用时使用规则回退。"
+        )
+        self.control_hint.setWordWrap(True)
+        self.control_hint.setObjectName("ControlHint")
+        control_layout.addWidget(self.control_hint)
+
+        # ── Manual action parameters + optional auto tactic ────────
+        self.manual_section = QtWidgets.QWidget()
+        self.manual_section.setObjectName("ManualSection")
+        manual_layout = QtWidgets.QVBoxLayout(self.manual_section)
+        manual_layout.setContentsMargins(0, 4, 0, 0)
+        manual_layout.setSpacing(5)
+
+        # Channel / power
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setSpacing(6)
+        ch_label = QtWidgets.QLabel("信道")
+        ch_label.setObjectName("ControlSubLabel")
+        action_row.addWidget(ch_label)
+        self.manual_ch_spin = QtWidgets.QSpinBox()
+        self.manual_ch_spin.setRange(1, self.num_channels)
+        self.manual_ch_spin.setValue(1)
+        self.manual_ch_spin.setFixedWidth(80)
+        self.manual_ch_spin.setToolTip("目标信道 1–10")
+        action_row.addWidget(self.manual_ch_spin)
+        power_label = QtWidgets.QLabel("功率")
+        power_label.setObjectName("ControlSubLabel")
+        action_row.addWidget(power_label)
+        self.manual_power_spin = QtWidgets.QSpinBox()
+        self.manual_power_spin.setRange(0, 20)
+        self.manual_power_spin.setValue(10)
+        self.manual_power_spin.setSuffix(" dB")
+        self.manual_power_spin.setFixedWidth(96)
+        self.manual_power_spin.setToolTip("请求发射增益 0–20 dB；0 dB 是最小增益，不是关闭发射")
+        action_row.addWidget(self.manual_power_spin)
+        action_row.addStretch(1)
+        manual_layout.addLayout(action_row)
+
+        bw_row = QtWidgets.QHBoxLayout()
+        bw_row.setSpacing(4)
+        bw_label = QtWidgets.QLabel("带宽")
+        bw_label.setObjectName("ControlSubLabel")
+        bw_label.setFixedWidth(52)
+        bw_row.addWidget(bw_label)
+        self.manual_bw_group = QtWidgets.QButtonGroup(self)
+        self.manual_bw_group.setExclusive(True)
+        self.manual_bw_buttons = {}
+        for bw in (2, 4, 6, 8):
+            button = QtWidgets.QPushButton(f"{bw}M")
+            button.setObjectName("ActionChoice")
+            button.setCheckable(True)
+            button.setMinimumHeight(26)
+            button.clicked.connect(self._on_manual_edit)
+            self.manual_bw_group.addButton(button)
+            self.manual_bw_buttons[bw] = button
+            bw_row.addWidget(button, stretch=1)
+        self.manual_bw_buttons[4].setChecked(True)
+        manual_layout.addLayout(bw_row)
+
+        wave_row = QtWidgets.QHBoxLayout()
+        wave_row.setSpacing(4)
+        wave_label = QtWidgets.QLabel("干扰模式")
+        wave_label.setObjectName("ControlSubLabel")
+        wave_label.setFixedWidth(52)
+        wave_row.addWidget(wave_label)
+        self.manual_wave_group = QtWidgets.QButtonGroup(self)
+        self.manual_wave_group.setExclusive(True)
+        self.manual_wave_buttons = {}
+        for label, mode in (("带限噪声", 0), ("多音干扰", 1)):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName("ActionChoice")
+            button.setCheckable(True)
+            button.setMinimumHeight(26)
+            button.clicked.connect(self._on_manual_edit)
+            self.manual_wave_group.addButton(button)
+            self.manual_wave_buttons[mode] = button
+            wave_row.addWidget(button, stretch=1)
+        self.manual_wave_buttons[0].setChecked(True)
+        manual_layout.addLayout(wave_row)
+
+        tactic_row = QtWidgets.QHBoxLayout()
+        tactic_row.setSpacing(4)
+        tactic_label = QtWidgets.QLabel("自动战术")
+        tactic_label.setObjectName("ControlSubLabel")
+        tactic_label.setFixedWidth(52)
+        tactic_row.addWidget(tactic_label)
+        self.manual_tactic_group = QtWidgets.QButtonGroup(self)
+        self.manual_tactic_group.setExclusive(True)
+        self.manual_tactic_buttons = {}
+        for label, key in (("恒定", "fixed"), ("扫频", "sweep"),
+                           ("随机跳频", "random"), ("目标跟踪", "target_track")):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName("TacticChoice")
+            button.setCheckable(True)
+            button.setMinimumHeight(26)
+            button.setToolTip({
+                "fixed": "保持所选动作不变，参数改动即时下发",
+                "sweep": "按信道顺序轮转，每信道驻留指定帧数",
+                "random": "随机跳到下一个信道，避免连续重复",
+                "target_track": "跟踪占用度最高的信道，阈值以下保持不动",
+            }[key])
+            button.clicked.connect(self._update_manual_tactic_fields)
+            self.manual_tactic_group.addButton(button)
+            self.manual_tactic_buttons[key] = button
+            tactic_row.addWidget(button, stretch=1)
+        self.manual_tactic_buttons["fixed"].setChecked(True)
+        manual_layout.addLayout(tactic_row)
+
+        # Dwell (sweep/random) or occupancy threshold (target tracking)
+        self.manual_dwell_widget = QtWidgets.QWidget()
+        dwell_row = QtWidgets.QHBoxLayout(self.manual_dwell_widget)
+        dwell_row.setContentsMargins(0, 0, 0, 0)
+        dwell_row.setSpacing(6)
+        dwell_label = QtWidgets.QLabel("驻留")
+        dwell_label.setObjectName("ControlSubLabel")
+        dwell_row.addWidget(dwell_label)
+        self.manual_dwell_spin = QtWidgets.QSpinBox()
+        self.manual_dwell_spin.setRange(1, 200)
+        self.manual_dwell_spin.setValue(10)
+        self.manual_dwell_spin.setSuffix(" 帧")
+        self.manual_dwell_spin.setToolTip("扫频/随机跳频在一个信道停留的遥测帧数")
+        self.manual_dwell_spin.setFixedWidth(96)
+        dwell_row.addWidget(self.manual_dwell_spin)
+        dwell_row.addStretch(1)
+        manual_layout.addWidget(self.manual_dwell_widget)
+
+        self.manual_threshold_widget = QtWidgets.QWidget()
+        threshold_row = QtWidgets.QHBoxLayout(self.manual_threshold_widget)
+        threshold_row.setContentsMargins(0, 0, 0, 0)
+        threshold_row.setSpacing(6)
+        threshold_label = QtWidgets.QLabel("最低占用度")
+        threshold_label.setObjectName("ControlSubLabel")
+        threshold_row.addWidget(threshold_label)
+        self.manual_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.manual_threshold_spin.setRange(0.0, 1.0)
+        self.manual_threshold_spin.setSingleStep(0.05)
+        self.manual_threshold_spin.setDecimals(2)
+        self.manual_threshold_spin.setValue(0.15)
+        self.manual_threshold_spin.setToolTip("目标跟踪仅切换到达到此占用度的信道")
+        self.manual_threshold_spin.setFixedWidth(96)
+        threshold_row.addWidget(self.manual_threshold_spin)
+        threshold_row.addStretch(1)
+        manual_layout.addWidget(self.manual_threshold_widget)
+
+        self.manual_apply_btn = QtWidgets.QPushButton("立即下发当前动作")
+        self.manual_apply_btn.setObjectName("ManualApplyBtn")
+        self.manual_apply_btn.setMinimumHeight(28)
+        self.manual_apply_btn.setToolTip("按当前参数与战术生成动作并经命令桥交给 MATLAB")
+        self.manual_apply_btn.clicked.connect(self._on_apply_manual)
+        manual_layout.addWidget(self.manual_apply_btn)
+
+        self.manual_section.setVisible(False)
+        control_layout.addWidget(self.manual_section)
+
+        # 0 dB is minimum gain, never TX-off — keep this visible in manual mode.
+        self.manual_note = QtWidgets.QLabel("功率 0 dB 是最小增益，不是停止发射。")
+        self.manual_note.setWordWrap(True)
+        self.manual_note.setObjectName("ControlHint")
+        self.manual_note.setVisible(False)
+        control_layout.addWidget(self.manual_note)
+
         # ── Strategy status bar (hidden when no strategy active) ─
         self.strategy_bar = QtWidgets.QWidget()
-        self.strategy_bar.setFixedHeight(36)
-        strategy_bar_layout = QtWidgets.QHBoxLayout(self.strategy_bar)
+        strategy_bar_layout = QtWidgets.QVBoxLayout(self.strategy_bar)
         strategy_bar_layout.setContentsMargins(0, 0, 0, 0)
-        strategy_bar_layout.setSpacing(8)
+        strategy_bar_layout.setSpacing(4)
         self.strategy_label = QtWidgets.QLabel("")
         self.strategy_label.setObjectName("StrategyLabel")
-        self.strategy_stop_btn = QtWidgets.QPushButton("停止策略")
+        self.strategy_label.setWordWrap(True)
+        self.strategy_stop_btn = QtWidgets.QPushButton("停止策略并交还 RL")
         self.strategy_stop_btn.setObjectName("AgentClearBtn")
-        self.strategy_stop_btn.setFixedWidth(70)
         self.strategy_stop_btn.clicked.connect(self._on_stop_strategy)
         strategy_bar_layout.addWidget(self.strategy_label)
         strategy_bar_layout.addWidget(self.strategy_stop_btn)
-        strategy_bar_layout.addStretch()
         self.strategy_bar.setVisible(False)
-        left_layout.addWidget(self.strategy_bar)
+        control_layout.addWidget(self.strategy_bar)
+
+        # Live parameter updates for the static (恒定) tactic.
+        self._manual_edit_timer = QtCore.QTimer(self)
+        self._manual_edit_timer.setSingleShot(True)
+        self._manual_edit_timer.setInterval(150)
+        self._manual_edit_timer.timeout.connect(self._apply_live_manual)
+        self._suspend_manual_edit = False
+        self.manual_ch_spin.valueChanged.connect(self._on_manual_edit)
+        self.manual_power_spin.valueChanged.connect(self._on_manual_edit)
+        self.manual_dwell_spin.valueChanged.connect(self._on_manual_edit)
+        self.manual_threshold_spin.valueChanged.connect(self._on_manual_edit)
+        self._update_manual_tactic_fields()
 
         # ── KPI Cards ──────────────────────────────────────
         cards = QtWidgets.QGridLayout()
@@ -325,10 +572,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # RIGHT SIDE — AI Assistant (full height)
         # ═══════════════════════════════════════════════════════
         self.agent_panel = AgentPanel()
+        self.agent_panel.setMinimumWidth(430)
+        self.agent_panel.set_control_widget(self.control_panel)
         master_split.addWidget(self.agent_panel)
 
-        # Left ~75%, Right ~25%
-        master_split.setSizes([1400, 460])
+        master_split.setSizes([1330, 530])
 
         root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(12, 10, 12, 10)
@@ -374,8 +622,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 border-radius: 10px; padding: 4px 10px; font-weight: 700; font-size: 9pt;
             }
             #StrategyLabel {
-                color: #ffb84d; font-weight: 600; font-size: 10pt;
-                background: #1a1f2e; border-radius: 6px; padding: 4px 10px;
+                color: #ffb84d; font-weight: 600; font-size: 9pt;
+                background: #1a1f2e; border-radius: 6px; padding: 6px 8px;
             }
             #KpiCard {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -437,6 +685,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 color: #8cb4ff; font-weight: 600; padding: 7px; font-size: 10pt;
             }
             #AgentSendBtn:hover { background: #223a5e; }
+            #ControlPanel {
+                background: #121a24; border: 1px solid #223247;
+                border-radius: 10px; padding: 6px 8px;
+            }
+            #ControlLabel { color: #dbe6f1; font-size: 10pt; font-weight: 600; }
+            #ControlSubLabel { color: #8ea0b5; font-size: 9pt; }
+            #ControlHint { color: #7f8ea3; font-size: 8pt; }
+            #ControlState {
+                border-radius: 8px; padding: 2px 8px;
+                font-weight: 700; font-size: 8pt;
+            }
+            #ManualSection { border-top: 1px solid #223247; }
+            #ManualApplyBtn {
+                background: #1d3a2b; border: 1px solid #2f6a4c; border-radius: 8px;
+                color: #7ef2b0; font-weight: 600; padding: 6px; font-size: 9pt;
+            }
+            #ManualApplyBtn:hover { background: #244b37; }
+            #StrategyChoice, #TacticChoice, #ActionChoice {
+                background: #172436; border: 1px solid #30465f;
+                border-radius: 7px; color: #b9c9da;
+                padding: 5px 4px; font-size: 9pt;
+            }
+            #StrategyChoice:hover, #TacticChoice:hover, #ActionChoice:hover {
+                background: #223a55;
+            }
+            #StrategyChoice:checked, #TacticChoice:checked, #ActionChoice:checked {
+                background: #274362; border: 1px solid #6da9e8;
+                color: #ffffff; font-weight: 700;
+            }
+            #StrategyChoice:disabled { color: #78889a; }
+            QComboBox {
+                background: #16202b; border: 1px solid #243244; border-radius: 8px;
+                color: #e8eef5; padding: 4px 8px; font-size: 10pt;
+            }
+            QComboBox:hover { background: #223247; }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QComboBox QAbstractItemView {
+                background: #16202b; border: 1px solid #243244;
+                color: #e8eef5; selection-background-color: #223247;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background: #16202b; border: 1px solid #243244; border-radius: 8px;
+                color: #e8eef5; padding: 4px 8px; font-size: 10pt;
+            }
         """)
 
     # ═══════════════════════════════════════════════════════════════
@@ -447,6 +739,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.agent_panel.send_message.connect(self._on_agent_message)
         self.agent_panel.clear_requested.connect(self._on_clear_agent)
         self.agent_panel.stop_requested.connect(self._on_stop_agent)
+        self.agent_panel.api_key_changed.connect(self._on_api_key_changed)
         if self._agent_init_error:
             self.agent_panel.show_error(f"Agent初始化失败:\n{self._agent_init_error}")
             self.agent_panel.set_connected(False)
@@ -454,6 +747,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.agent_panel.set_connected(self.agent_brain.enabled)
         else:
             self.agent_panel.set_connected(False)
+
+    @QtCore.pyqtSlot(str)
+    def _on_api_key_changed(self, key: str):
+        """Apply a key saved from the credential dialog without a restart."""
+        if not self.agent_brain:
+            return
+        key = (key or "").strip()
+        try:
+            self.agent_brain.set_api_key(key)
+        except Exception as exc:  # network stack or provider error
+            self.agent_panel.show_error(f"密钥已保存，但初始化失败: {exc}")
+            self.agent_panel.set_connected(False)
+            return
+        self.agent_panel.set_connected(self.agent_brain.enabled)
+        if self.agent_brain.enabled:
+            self.agent_panel.show_response("密钥已生效，可以开始用自然语言控制干扰系统。")
+        else:
+            self.agent_panel.show_response("已清除密钥，自然语言交互不可用；策略与手动控制仍可使用。")
 
     def _on_clear_agent(self):
         """Handle new-conversation request from agent panel."""
@@ -503,6 +814,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def _apply_set_params(self, params: dict):
+        # A one-shot Agent tool command takes ownership away from any running
+        # strategy so the next telemetry tick cannot overwrite it.
+        self._enter_manual_mode()
+        self.manual_tactic_buttons["fixed"].setChecked(True)
+        self._update_manual_tactic_fields()
+        # Only the command below may reach MATLAB; the field sync must not
+        # trigger the live-apply timer and duplicate it.
+        self._suspend_manual_edit = True
+        try:
+            if "channel_idx" in params:
+                self.manual_ch_spin.setValue(int(params["channel_idx"]) + 1)
+            if "power_db" in params:
+                self.manual_power_spin.setValue(round(float(params["power_db"])))
+            if "bw_mhz" in params:
+                self.manual_bw_buttons[int(params["bw_mhz"])].setChecked(True)
+            if "waveform_mode" in params:
+                self.manual_wave_buttons[int(params["waveform_mode"])].setChecked(True)
+        finally:
+            self._suspend_manual_edit = False
         self.cmd_bridge.enqueue_command(params)
         print(f"[Agent] 已入队控制命令: {params}")
 
@@ -515,10 +845,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(str)
     def _apply_control_mode(self, mode: str):
         """Apply control mode switch on the main thread."""
-        self._agent_control_mode = mode
-        self._update_mode_badge()
-        self.cmd_bridge.enqueue_control_mode(mode)
-        self.agent_panel.set_control_mode(mode)
+        if mode == "rl":
+            self._apply_cancel_strategy()
+        else:
+            self._enter_manual_mode()
         print(f"[Agent] 控制模式切换 -> {mode}")
 
     def _on_agent_strategy(self, strategy_name: str, params: dict):
@@ -532,17 +862,26 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(str, dict)
     def _apply_strategy(self, strategy_name: str, params: dict):
         """Apply strategy start on the main thread."""
-        if self._agent_control_mode != "agent":
-            self._agent_control_mode = "agent"
-            self._update_mode_badge()
-            self.cmd_bridge.enqueue_control_mode("agent")
-        self.strategy_engine.start_strategy(strategy_name, params)
-        first_action = self.strategy_engine.tick()
+        try:
+            self.strategy_engine.start_strategy(strategy_name, params)
+        except (TypeError, ValueError) as exc:
+            self.agent_panel.show_error(f"策略参数无效: {exc}")
+            return
+        self._decision_generation += 1
+        self._decision_pending = False
+        self._manual_mode = False
+        self._set_manual_visible(False)
+        self._agent_control_mode = "agent"
+        self._update_mode_badge()
+        self.cmd_bridge.enqueue_control_mode("agent")
+        first_action = self.strategy_engine.tick(**self._last_sensing)
         if first_action:
             self.cmd_bridge.enqueue_action(first_action)
             print(f"[Agent] 策略首帧动作已入队: {first_action}")
-        self.strategy_bar.setVisible(True)
+        self._preset_source = "规则初始动作" if strategy_name in PRESET_STRATEGIES else "本地规则"
+        self._update_strategy_bar()
         self.agent_panel.set_control_mode("agent")
+        self._sync_strategy_choice()
         print(f"[Agent] 启动策略 {strategy_name} 参数={params}")
 
     def _on_agent_cancel_strategy(self):
@@ -554,14 +893,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_cancel_strategy(self):
         """Apply strategy cancellation on the main thread."""
         self.strategy_engine.stop_strategy()
+        self._decision_generation += 1
+        self._decision_pending = False
         self._agent_control_mode = "rl"
+        self._manual_mode = False
+        self._set_manual_visible(False)
         self._update_mode_badge()
         self.strategy_bar.setVisible(False)
         self.cmd_bridge.enqueue_control_mode("rl")
         self.agent_panel.set_control_mode("rl")
+        self._sync_strategy_choice()
         print("[Agent] 已取消策略，交还RL控制")
 
-    def _push_state_to_agent(self):
+    def _push_state_to_agent(self, prev_action=None):
         if not self.agent_brain:
             return
         system_state = {}
@@ -582,20 +926,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.lbl_time.text() != "--":
             system_state["最新更新"] = self.lbl_time.text()
 
-        ch_feats = []
-        for i in range(self.channel_table.rowCount()):
-            row_data = []
-            for j in range(1, 5):
-                item = self.channel_table.item(i, j)
-                if item:
-                    try:
-                        row_data.append(float(item.text()))
-                    except ValueError:
-                        row_data.append(0.0)
-                else:
-                    row_data.append(0.0)
-            if any(v != 0.0 for v in row_data):
-                ch_feats.append(row_data)
+        # Preserve all ten rows, including all-zero channels. Dropping them
+        # shifts the channel indices sent to Agent/RL tool calls.
+        ch_feats = self._last_sensing.get("channel_features") or []
 
         self.agent_brain.update_state(
             system_state=system_state,
@@ -604,6 +937,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bw_history=list(self.bw_history),
             power_history=list(self.power_history),
             channel_map_history=list(self.channel_history),
+            prev_action=prev_action,
         )
 
     # ═══════════════════════════════════════════════════════════════
@@ -611,18 +945,31 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
 
     def _update_mode_badge(self):
-        if self._agent_control_mode == "agent":
-            self.mode_badge.setText("Agent 手动")
-            self.mode_badge.setStyleSheet(
-                "#ModeBadge { color: #c792ea; background: #1a1525; "
-                "border: 1px solid #3a2a5a; border-radius: 10px; "
-                "padding: 4px 10px; font-weight: 700; font-size: 9pt; }")
+        if self._manual_mode:
+            text, color, bg, border = "手动模式", "#ffb84d", "#221a10", "#5a4020"
+        elif self._agent_control_mode == "agent":
+            text, color, bg, border = "Agent 策略", "#c792ea", "#1a1525", "#3a2a5a"
         else:
-            self.mode_badge.setText("RL 自动")
-            self.mode_badge.setStyleSheet(
-                "#ModeBadge { color: #6ee7b7; background: #11231a; "
-                "border: 1px solid #1a4a3a; border-radius: 10px; "
-                "padding: 4px 10px; font-weight: 700; font-size: 9pt; }")
+            text, color, bg, border = "RL 自动", "#6ee7b7", "#11231a", "#1a4a3a"
+        self.mode_badge.setText(text)
+        self.mode_badge.setStyleSheet(
+            f"#ModeBadge {{ color: {color}; background: {bg}; "
+            f"border: 1px solid {border}; border-radius: 10px; "
+            f"padding: 4px 10px; font-weight: 700; font-size: 9pt; }}")
+        # Mirror the state inside the control card so the operator sees the
+        # effective controller next to the candidate boxes.
+        self.control_state_label.setText(text)
+        self.control_state_label.setStyleSheet(
+            f"#ControlState {{ color: {color}; background: {bg}; "
+            f"border: 1px solid {border}; border-radius: 8px; "
+            f"padding: 2px 8px; font-weight: 700; font-size: 8pt; }}")
+
+    def _set_manual_visible(self, visible: bool):
+        """Show or hide the manual tactic/parameter block."""
+        self.manual_section.setVisible(visible)
+        self.manual_note.setVisible(visible)
+        if not visible:
+            self._manual_edit_timer.stop()
 
     def _update_strategy_bar(self):
         """Update strategy status label with current progress."""
@@ -634,31 +981,247 @@ class MainWindow(QtWidgets.QMainWindow):
         detail = ""
         s = eng._strategy
         if hasattr(s, '_idx') and hasattr(s, 'channels'):
-            ch = s.channels[s._idx % len(s.channels)] if s.channels else "?"
-            total = len(s.channels)
-            dwell = getattr(s, 'dwell_frames', 0)
-            remain = max(0, dwell - s._frame) if dwell else 0
-            detail = f"| 信道 {int(ch)+1}/{total} | 剩余 {remain} 帧"
+            next_ch = s.channels[s._idx % len(s.channels)]
+            last_ch = getattr(s, 'last_channel', next_ch)
+            detail = (f"| 最近: 信道 {int(last_ch)+1}"
+                      f" | 下次候选: 信道 {int(next_ch)+1}")
         elif hasattr(s, 'current_channel'):
             detail = f"| 目标: 信道 {int(s.current_channel)+1}"
-        self.strategy_label.setText(f"策略: {name} {detail}")
+            if name == "random":
+                detail = (f"| 最近: 信道 {int(s.last_channel)+1}"
+                          f" | 下次候选: 信道 {int(s.current_channel)+1}")
+        elif hasattr(s, 'action'):
+            detail = f"| 信道 {int(s.action['channel_idx'])+1}"
+        source = f" | {self._preset_source}" if name in PRESET_STRATEGIES else ""
+        label = {"fixed": "恒定", "sweep": "扫频", "random": "随机跳频",
+                 "target_track": "目标跟踪", "coerce": "强制型",
+                 "energy_save": "能量节约型", "deception": "欺骗诱导型",
+                 "track_busiest": "占用度最高", "track_weakest": "SNR 最低",
+                 "alternating": "轮换", "reactive": "反应式"}.get(name, name)
+        self.strategy_label.setText(f"策略: {label}{source} {detail}")
         self.strategy_bar.setVisible(True)
 
     def _on_stop_strategy(self):
         """User manually stops the active strategy via the UI button."""
-        self.strategy_engine.stop_strategy()
-        self._agent_control_mode = "rl"
-        self._update_mode_badge()
-        self.strategy_bar.setVisible(False)
-        self.cmd_bridge.enqueue_control_mode("rl")
-        self.agent_panel.set_control_mode("rl")
+        self._apply_cancel_strategy()
         print("[UI] 手动停止策略，交还RL控制")
+
+    # ── Control panel handlers ────────────────────────────────
+
+    def _on_strategy_choice(self, key):
+        if key == "rl":
+            self._apply_cancel_strategy()
+        elif key == "manual":
+            self._enter_manual_mode()
+        elif key == "custom":
+            return
+        else:
+            self._apply_strategy(key, dict(PRESET_STRATEGIES.get(key, {})))
+
+    def _manual_action(self):
+        return {
+            "channel_idx": self.manual_ch_spin.value() - 1,
+            "power_db": float(self.manual_power_spin.value()),
+            "bw_mhz": next(bw for bw, btn in self.manual_bw_buttons.items()
+                           if btn.isChecked()),
+            "waveform_mode": next(mode for mode, btn in self.manual_wave_buttons.items()
+                                  if btn.isChecked()),
+        }
+
+    def _selected_manual_tactic(self):
+        return next(key for key, btn in self.manual_tactic_buttons.items()
+                    if btn.isChecked())
+
+    def _update_manual_tactic_fields(self, _checked=None):
+        tactic = self._selected_manual_tactic()
+        uses_dwell = tactic in ("sweep", "random")
+        uses_threshold = tactic == "target_track"
+        self.manual_dwell_widget.setVisible(uses_dwell)
+        self.manual_threshold_widget.setVisible(uses_threshold)
+        self.manual_ch_spin.setToolTip(
+            "目标信道" if tactic == "fixed" else
+            "首个信道" if tactic in ("sweep", "random") else
+            "初始目标；随后根据占用度跟踪")
+        # Sequence tactics keep their cursor, so parameter tweaks only apply
+        # after an explicit restart; 恒定 updates live.
+        self._manual_dirty = False
+        self._refresh_manual_apply_label()
+
+    def _refresh_manual_apply_label(self):
+        tactic = self._selected_manual_tactic()
+        if self._manual_dirty:
+            self.manual_apply_btn.setText("应用参数（重启战术）")
+        elif not self._manual_mode:
+            self.manual_apply_btn.setText("启动手动控制")
+        elif tactic == "fixed":
+            self.manual_apply_btn.setText("立即下发当前动作")
+        else:
+            self.manual_apply_btn.setText("重新启动战术")
+
+    def _on_manual_edit(self, *_):
+        """Enqueue the static action as soon as a parameter changes."""
+        if self._suspend_manual_edit or not self._manual_mode:
+            return
+        if self._selected_manual_tactic() == "fixed":
+            self._manual_edit_timer.start()
+            return
+        self._manual_dirty = True
+        self._refresh_manual_apply_label()
+
+    def _apply_live_manual(self):
+        """Re-send the 恒定 action without restarting the whole tactic."""
+        if not self._manual_mode or self._selected_manual_tactic() != "fixed":
+            return
+        action = self._manual_action()
+        self.strategy_engine.start_strategy("fixed", dict(action))
+        first_action = self.strategy_engine.tick(**self._last_sensing)
+        if first_action:
+            self.cmd_bridge.enqueue_action(first_action)
+        self._update_strategy_bar()
+
+    def _start_manual_tactic(self):
+        """Translate the operator's tactic choice into per-frame actions."""
+        tactic = self._selected_manual_tactic()
+        action = self._manual_action()
+        channel_idx = int(action.pop("channel_idx"))
+        if tactic == "fixed":
+            params = {"channel_idx": channel_idx, **action}
+        elif tactic == "sweep":
+            params = {"channels": list(range(channel_idx, self.num_channels)) +
+                      list(range(channel_idx)),
+                      "dwell_frames": self.manual_dwell_spin.value(), **action}
+        elif tactic == "random":
+            params = {"channels": list(range(self.num_channels)),
+                      "start_channel": channel_idx,
+                      "dwell_frames": self.manual_dwell_spin.value(), **action}
+        elif tactic == "target_track":
+            params = {"channel_idx": channel_idx,
+                      "min_occupancy": self.manual_threshold_spin.value(), **action}
+        else:
+            raise ValueError(f"未知干扰战术: {tactic}")
+        self.strategy_engine.start_strategy(tactic, params)
+        first_action = self.strategy_engine.tick(**self._last_sensing)
+        if first_action:
+            self.cmd_bridge.enqueue_action(first_action)
+        self._manual_dirty = False
+        self._refresh_manual_apply_label()
+        self._update_strategy_bar()
+        print(f"[Manual] 已启动 {tactic}: {params}")
+
+    def _enter_manual_mode(self):
+        self.strategy_engine.stop_strategy()
+        self._decision_generation += 1
+        self._decision_pending = False
+        self._manual_mode = True
+        self._agent_control_mode = "agent"
+        self._set_manual_visible(True)
+        self.strategy_bar.setVisible(False)
+        self._update_mode_badge()
+        self.cmd_bridge.enqueue_control_mode("agent")
+        if self._last_action:
+            # Sync the fields without firing a live update.
+            self._suspend_manual_edit = True
+            try:
+                self.manual_ch_spin.setValue(int(self._last_action["channel_idx"]) + 1)
+                self.manual_power_spin.setValue(round(float(self._last_action["power_db"])))
+                bw = int(self._last_action["bw_mhz"])
+                if bw in self.manual_bw_buttons:
+                    self.manual_bw_buttons[bw].setChecked(True)
+                mode = int(self._last_action["waveform_mode"])
+                if mode in self.manual_wave_buttons:
+                    self.manual_wave_buttons[mode].setChecked(True)
+            finally:
+                self._suspend_manual_edit = False
+        self._manual_dirty = False
+        self._refresh_manual_apply_label()
+        self.agent_panel.set_control_mode("agent")
+        self._sync_strategy_choice()
+
+    def _on_apply_manual(self):
+        if not self._manual_mode:
+            self._enter_manual_mode()
+        self._start_manual_tactic()
+
+    def _sync_strategy_choice(self):
+        """Keep the candidate buttons consistent with the active controller."""
+        chat_rule_active = (self.strategy_engine.active and not self._manual_mode
+                            and self.strategy_engine.strategy_name not in PRESET_STRATEGIES)
+        # 聊天策略 only becomes a real target when a chat tool started a rule tactic.
+        self.strategy_buttons["custom"].setEnabled(chat_rule_active)
+        self.strategy_buttons["custom"].setToolTip(
+            "当前由聊天工具启动的规则战术；点其他候选框可收回控制权"
+            if chat_rule_active else
+            "聊天工具启动扫频/随机等规则战术时自动启用")
+        if self._manual_mode:
+            key = "manual"
+        elif self.strategy_engine.active:
+            name = self.strategy_engine.strategy_name
+            key = name if name in PRESET_STRATEGIES else "custom"
+        else:
+            key = "rl"
+        self.strategy_buttons[key].setChecked(True)
+        if key == "manual":
+            hint = "信道、功率、带宽、干扰模式可直接点选并即时下发；选扫频/随机/跟踪后改参数需点应用重启。"
+        elif key in PRESET_STRATEGIES:
+            hint = "Agent 逐帧调用 RL 候选并施加类型约束；断线时规则回退。"
+        elif key == "custom":
+            hint = "聊天工具已启动规则策略；可点其他候选框收回控制权。"
+        else:
+            hint = "MATLAB 逐帧直连 RL 服务。点击候选框即切换控制权。"
+        self.control_hint.setText(hint)
+
+    def _schedule_preset_decision(self, sensing: dict, prev_action: dict):
+        """Get an RL proposal off the UI thread; one request may be in flight."""
+        features = sensing.get("channel_features") or []
+        if (self._decision_pending or len(features) != self.num_channels
+                or any(not isinstance(row, list) or len(row) != 4 for row in features)):
+            return
+        self._decision_pending = True
+        generation = self._decision_generation
+        snapshot = dict(sensing)
+        future = self._decision_executor.submit(
+            request_rl_action, snapshot["channel_features"], prev_action,
+            self.num_channels, timeout=0.5,
+        )
+
+        def deliver(completed):
+            try:
+                result = completed.result()
+            except Exception:
+                result = None
+            if not self._closing:
+                try:
+                    self.preset_decision_ready.emit((generation, snapshot, result))
+                except RuntimeError:
+                    pass
+
+        future.add_done_callback(deliver)
+
+    @QtCore.pyqtSlot(object)
+    def _on_preset_decision(self, payload):
+        generation, sensing, result = payload
+        if generation != self._decision_generation or self._closing:
+            return
+        self._decision_pending = False
+        if (self._agent_control_mode != "agent" or self._manual_mode
+                or self.strategy_engine.strategy_name not in PRESET_STRATEGIES):
+            return
+        action = self.strategy_engine.tick(
+            **sensing, rl_action=result[0] if result else None,
+        )
+        if action:
+            self.cmd_bridge.enqueue_action(action)
+        policy = result[1].get("policy", "RL") if result else ""
+        self._preset_source = f"{policy} 候选 + 类型约束" if result else "规则回退（RL不可用）"
+        self._update_strategy_bar()
 
     # ═══════════════════════════════════════════════════════════════
     # Telemetry handling
     # ═══════════════════════════════════════════════════════════════
 
     def closeEvent(self, event):
+        self._closing = True
+        self._decision_executor.shutdown(wait=False, cancel_futures=True)
         self.server.stop()
         self.cmd_bridge.stop()
         self.server.join(timeout=2.0)
@@ -695,9 +1258,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # KPI cards
         self.conn_badge.setText("已连接  127.0.0.1:5555")
         self.dot_telem.setStyleSheet("color: #6ee7b7; font-size: 10pt;")
-        # RL status: inferred from rl_meta policy name
-        rl_ok = policy not in ("", "unknown", "fallback", "compat_default", "agent")
-        self.dot_rl.setStyleSheet(f"color: {'#6ee7b7' if rl_ok else '#ff5c73'}; font-size: 10pt;")
+        # In Agent preset mode MATLAB reports policy=agent; use the result
+        # of the UI's own RL request for its indicator.
+        if self.strategy_engine.strategy_name in PRESET_STRATEGIES:
+            if "候选" in self._preset_source:
+                rl_color = "#6ee7b7"
+            elif "回退" in self._preset_source:
+                rl_color = "#ff5c73"
+            else:
+                rl_color = "#888888"
+        elif self._agent_control_mode == "agent":
+            rl_color = "#888888"  # no RL request in manual/one-shot mode
+        else:
+            rl_ok = policy not in ("", "unknown", "fallback", "compat_default", "agent")
+            rl_color = "#6ee7b7" if rl_ok else "#ff5c73"
+        self.dot_rl.setStyleSheet(f"color: {rl_color}; font-size: 10pt;")
         # cmd bridge status
         cmd_ok = self.cmd_bridge.is_connected
         self.dot_cmd.setStyleSheet(f"color: {'#6ee7b7' if cmd_ok else '#ff5c73'}; font-size: 10pt;")
@@ -708,7 +1283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_pwr.setText(f"{power_db:.1f} dB")
         self.lbl_jbw.setText(f"{bw_mhz} MHz")
         self.lbl_mode.setText("带限噪声" if waveform_mode == 0 else "多音干扰")
-        self.lbl_pol.setText(f"{policy} / {latency} ms")
+        self.lbl_pol.setText("Agent 下发" if policy == "agent" else f"{policy} / {latency} ms")
         self.lbl_time.setText(datetime.now().strftime("%H:%M:%S"))
 
         # Spectrum
@@ -773,13 +1348,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 for j, val in enumerate(vals):
                     self.channel_table.setItem(i, j, QtWidgets.QTableWidgetItem(val))
 
-        # ── Strategy engine tick ────────────────────────────
-        if self.strategy_engine.active:
+        prev_action = {
+            "channel_idx": channel_idx,
+            "power_db": power_db,
+            "bw_mhz": bw_mhz,
+            "waveform_mode": waveform_mode,
+        }
+        sensing = {
+            "channel_features": ch_feat.tolist() if ch_feat.size > 0 else None,
+            "channel_map": ch_map.tolist() if ch_map.size > 0 else None,
+            "snr": snr,
+            "bw_est": bw_est,
+        }
+        self._last_action = prev_action
+        self._last_sensing = sensing
+
+        # ── Agent-owned decisions ─────────────────────────────
+        if (self.strategy_engine.active and self._agent_control_mode == "agent"
+                and not self._manual_mode and
+                self.strategy_engine.strategy_name in PRESET_STRATEGIES):
+            self._schedule_preset_decision(sensing, prev_action)
+            self._update_strategy_bar()
+        elif self.strategy_engine.active and self._agent_control_mode == "agent":
             agent_action = self.strategy_engine.tick(
-                channel_features=ch_feat.tolist() if ch_feat.size > 0 else None,
-                channel_map=ch_map.tolist() if ch_map.size > 0 else None,
-                snr=snr,
-                bw_est=bw_est,
+                **sensing,
             )
             if agent_action:
                 self.cmd_bridge.enqueue_action(agent_action)
@@ -791,7 +1383,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.strategy_bar.isVisible():
             self.strategy_bar.setVisible(False)
 
-        self._push_state_to_agent()
+        self._push_state_to_agent(prev_action)
 
     @staticmethod
     def _tx_text(tx_state: str) -> str:

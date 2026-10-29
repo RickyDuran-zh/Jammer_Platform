@@ -2,7 +2,12 @@
 Tool definitions (OpenAI function-calling format) and handler factories for the jammer agent.
 """
 import json
+import inspect
+import math
 from typing import Callable
+
+from .rl_client import request_rl_action
+from .strategy_engine import STRATEGY_REGISTRY
 
 
 # ── Helper to build an OpenAI-function-format tool definition ─────
@@ -59,7 +64,7 @@ TOOL_GET_CHANNEL_MAP_HISTORY = _tool(
 
 TOOL_SET_JAMMING_PARAMETERS = _tool(
     "set_jamming_parameters",
-    "设置干扰控制参数。可以修改目标信道、发射功率、干扰带宽和波形模式。修改后的参数将通过控制通道发送到MATLAB后端执行。",
+    "设置一次性干扰动作，自动切换到 Agent 控制并经现有命令桥入队给 MATLAB。可修改目标信道、功率、带宽和波形。",
     {
         "channel_idx": {
             "type": "integer",
@@ -87,7 +92,7 @@ TOOL_ANALYZE_SITUATION = _tool(
 
 TOOL_SWITCH_CONTROL_MODE = _tool(
     "switch_control_mode",
-    "切换干扰控制模式。可以选择让强化学习(RL)算法自动决策，或者让AI Agent手动控制干扰参数。切换后告知用户当前模式。",
+    "切换控制权：rl 为 MATLAB 逐帧直连 RL；agent 为 UI/Agent 下发动作。切换为 agent 后还需执行策略或设置参数。",
     {
         "mode": {
             "type": "string",
@@ -100,24 +105,31 @@ TOOL_SWITCH_CONTROL_MODE = _tool(
 
 TOOL_EXECUTE_STRATEGY = _tool(
     "execute_strategy",
-    "执行一个干扰策略。支持6种策略: fixed(固定参数), sweep(信道扫描), track_busiest(追踪最强信号), track_weakest(追踪最弱信号), alternating(交替切换), reactive(自适应波形)。根据用户意图选择策略并配置参数。",
+    "执行规则干扰战术：fixed 恒定、sweep 扫频、random 随机跳频、target_track 按占用度目标跟踪；另有 track_busiest/track_weakest/alternating/reactive。coerce/energy_save/deception 为逐帧调用 RL 并施加约束的实验预设。waveform_mode 是独立的噪声/多音波形选择。",
     {
         "strategy": {
             "type": "string",
-            "description": "策略名称: fixed/sweep/track_busiest/track_weakest/alternating/reactive",
-            "enum": ["fixed", "sweep", "track_busiest", "track_weakest", "alternating", "reactive"],
+            "description": "策略名称: fixed/sweep/random/target_track/track_busiest/track_weakest/alternating/reactive/coerce/energy_save/deception",
+            "enum": ["fixed", "sweep", "random", "target_track", "track_busiest", "track_weakest", "alternating", "reactive", "coerce", "energy_save", "deception"],
         },
-        "channel_idx": {"type": "integer", "description": "目标信道 0-9 (fixed/reactive策略)"},
-        "channels": {"type": "array", "items": {"type": "integer"}, "description": "信道列表 (sweep/alternating策略，如[0,1,2,3,4,5,6,7,8,9])"},
-        "dwell_frames": {"type": "integer", "description": "每个信道停留帧数，默认25帧约2秒(sweep/alternating策略)"},
+        "channel_idx": {"type": "integer", "description": "目标/初始信道 0-9 (fixed/target_track/reactive)"},
+        "start_channel": {"type": "integer", "description": "随机跳频首个信道 0-9"},
+        "channels": {"type": "array", "items": {"type": "integer"}, "description": "信道列表 (sweep/random/alternating，如[0,1,2,3,4,5,6,7,8,9])"},
+        "dwell_frames": {"type": "integer", "description": "每信道驻留遥测帧数 (sweep/random/alternating)"},
         "power_db": {"type": "number", "description": "功率 0-20 dB，默认10"},
         "bw_mhz": {"type": "integer", "description": "带宽 2/4/6/8 MHz，默认4"},
         "waveform_mode": {"type": "integer", "description": "波形模式: 0=带限噪声 1=多音干扰，默认0"},
-        "min_occupancy": {"type": "number", "description": "最低占用度阈值 0-1 (track_busiest策略，低于此值不切换)"},
+        "min_occupancy": {"type": "number", "description": "最低占用度阈值 0-1 (target_track/track_busiest策略)"},
+        "switch_margin": {"type": "number", "description": "目标跟踪切换滞回阈值 0-1，默认0.05"},
         "noise_below_snr": {"type": "number", "description": "低于此SNR使用噪声 (reactive策略)"},
         "tone_above_snr": {"type": "number", "description": "高于此SNR使用多音 (reactive策略)"},
     },
     required=["strategy"],
+)
+
+TOOL_CALL_RL_INFERENCE = _tool(
+    "call_rl_inference",
+    "调用当前运行的RL决策算法(PPO/A2C/BDQ)推理一次动作，切换至 Agent 一次性控制并入队给 MATLAB。连续自主决策请使用 execute_strategy 的三种预设。",
 )
 
 TOOL_CANCEL_STRATEGY = _tool(
@@ -134,6 +146,7 @@ ALL_TOOL_DEFS = [
     TOOL_ANALYZE_SITUATION,
     TOOL_SWITCH_CONTROL_MODE,
     TOOL_EXECUTE_STRATEGY,
+    TOOL_CALL_RL_INFERENCE,
     TOOL_CANCEL_STRATEGY,
 ]
 
@@ -150,6 +163,7 @@ class ToolHandlers:
         self._bw_history: list = []
         self._power_history: list = []
         self._channel_map_history: list = []
+        self._prev_action: dict = {}
         self._on_set_params: Callable | None = None
         self._on_control_mode: Callable | None = None
         self._on_strategy: Callable | None = None
@@ -161,7 +175,8 @@ class ToolHandlers:
                      snr_history: list | None = None,
                      bw_history: list | None = None,
                      power_history: list | None = None,
-                     channel_map_history: list | None = None):
+                     channel_map_history: list | None = None,
+                     prev_action: dict | None = None):
         """Update cached state from the UI telemetry handler. Called each frame."""
         if system_state is not None:
             self._system_state = system_state
@@ -175,6 +190,8 @@ class ToolHandlers:
             self._power_history = power_history
         if channel_map_history is not None:
             self._channel_map_history = channel_map_history
+        if prev_action is not None:
+            self._prev_action = prev_action
 
     def set_on_set_params(self, callback: Callable):
         self._on_set_params = callback
@@ -298,6 +315,12 @@ class ToolHandlers:
                     params[key] = float(val)
         if not params:
             return json.dumps({"error": "未提供要修改的参数"}, ensure_ascii=False)
+        if ("channel_idx" in params and not 0 <= params["channel_idx"] < 10
+                or "power_db" in params and not (math.isfinite(params["power_db"])
+                                                 and 0 <= params["power_db"] <= 20)
+                or "bw_mhz" in params and params["bw_mhz"] not in (2, 4, 6, 8)
+                or "waveform_mode" in params and params["waveform_mode"] not in (0, 1)):
+            return json.dumps({"error": "动作越界：信道0-9、功率0-20、带宽2/4/6/8、波形0/1"}, ensure_ascii=False)
         try:
             self._on_set_params(params)
             result = {"success": True, "已发送参数": params}
@@ -367,7 +390,7 @@ class ToolHandlers:
             self._on_control_mode(mode)
             result = {
                 "success": True,
-                "当前控制模式": "AI Agent手动控制" if mode == "agent" else "RL强化学习自动决策",
+                "已请求控制模式": "UI/Agent下发动作" if mode == "agent" else "MATLAB直连RL自动决策",
             }
             result.update(self._bridge_status_fields())
             return json.dumps(result, ensure_ascii=False, indent=2)
@@ -375,17 +398,40 @@ class ToolHandlers:
 
     def handle_execute_strategy(self, inp: dict) -> str:
         strategy_name = inp.get("strategy", "")
-        if not strategy_name:
-            return json.dumps({"error": "未指定策略名称"}, ensure_ascii=False)
+        if strategy_name not in STRATEGY_REGISTRY:
+            return json.dumps({"error": f"未知策略: {strategy_name}"}, ensure_ascii=False)
 
         # Build params from input, filtering None values
         params = {}
-        param_keys = ["channel_idx", "channels", "dwell_frames", "power_db",
-                      "bw_mhz", "waveform_mode", "min_occupancy",
+        param_keys = ["channel_idx", "start_channel", "channels", "dwell_frames", "power_db",
+                      "bw_mhz", "waveform_mode", "min_occupancy", "switch_margin",
                       "noise_below_snr", "tone_above_snr"]
         for k in param_keys:
             if k in inp and inp[k] is not None:
                 params[k] = inp[k]
+
+        try:
+            inspect.signature(STRATEGY_REGISTRY[strategy_name]).bind(**params)
+            if ("channel_idx" in params and not 0 <= int(params["channel_idx"]) < 10
+                    or "start_channel" in params and not 0 <= int(params["start_channel"]) < 10
+                    or "channels" in params and
+                    (not params["channels"] or any(not 0 <= int(ch) < 10 for ch in params["channels"]))
+                    or "dwell_frames" in params and not 1 <= int(params["dwell_frames"]) <= 200
+                    or "power_db" in params and not (math.isfinite(float(params["power_db"]))
+                                                     and 0 <= float(params["power_db"]) <= 20)
+                    or "bw_mhz" in params and int(params["bw_mhz"]) not in (2, 4, 6, 8)
+                    or "waveform_mode" in params and int(params["waveform_mode"]) not in (0, 1)
+                    or "min_occupancy" in params and not 0 <= float(params["min_occupancy"]) <= 1
+                    or "switch_margin" in params and not 0 <= float(params["switch_margin"]) <= 1):
+                raise ValueError("策略参数超出动作范围")
+            if strategy_name == "random" and "channels" in params:
+                if len(set(params["channels"])) < 2:
+                    raise ValueError("随机跳频至少需要两个不同信道")
+                if ("start_channel" in params and
+                        params["start_channel"] not in params["channels"]):
+                    raise ValueError("首个信道必须包含在随机跳频信道列表中")
+        except (TypeError, ValueError) as exc:
+            return json.dumps({"error": f"策略参数无效: {exc}"}, ensure_ascii=False)
 
         if self._on_strategy:
             try:
@@ -400,6 +446,32 @@ class ToolHandlers:
             except Exception as e:
                 return json.dumps({"error": f"策略执行失败: {e}"}, ensure_ascii=False)
         return json.dumps({"error": "策略回调未就绪"}, ensure_ascii=False)
+
+    def handle_call_rl_inference(self, _inp: dict) -> str:
+        if self._on_set_params is None:
+            return json.dumps({"error": "控制通道未就绪，无法发送动作"}, ensure_ascii=False)
+        if (len(self._channel_features) != 10 or
+                any(len(row) != 4 for row in self._channel_features)):
+            return json.dumps({"error": "需先收到完整的10信道特征，才能进行RL推理"}, ensure_ascii=False)
+        result = request_rl_action(self._channel_features, self._prev_action)
+        if result is None:
+            return json.dumps({
+                "error": "RL 服务不可用或未运行，可回退到 execute_strategy 规则策略",
+            }, ensure_ascii=False)
+        action, rl_meta = result
+        try:
+            self._on_set_params(action)
+            resp = {
+                "success": True,
+                "已下发RL动作": action,
+                "决策算法": rl_meta.get("policy", "unknown"),
+                "value": rl_meta.get("value"),
+                "latency_ms": rl_meta.get("latency_ms"),
+            }
+            resp.update(self._bridge_status_fields())
+            return json.dumps(resp, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"RL动作下发失败: {e}"}, ensure_ascii=False)
 
     def handle_cancel_strategy(self, _inp: dict) -> str:
         if self._on_cancel_strategy:

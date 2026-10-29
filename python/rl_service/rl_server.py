@@ -4,6 +4,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 
 import numpy as np
@@ -24,6 +25,7 @@ class RLServer:
         self.algo = algo
         self._stop = False
         self.compat_policy = CompatSpectrumPolicy(num_channels=10)
+        self._infer_lock = threading.Lock()
 
         env = JammerSpectrumCtrlEnv()
         self.env_obs_dim = env.obs_dim
@@ -71,36 +73,22 @@ class RLServer:
         if obs is None:
             return self.compat_policy.select_action(state)
 
-        if self.algo == "bdq":
-            action, value = self.agent.act(obs, deterministic=True)
-            meta = {"policy": "bdq", "value": value}
-            return action, meta
-        elif self.algo == "a2c":
-            action, _, _, value = self.agent.act(obs, deterministic=True)
-            meta = {"policy": "a2c", "value": value}
-            return action, meta
-        else:
-            action, _, _, value = self.agent.act(obs, deterministic=True)
-            meta = {"policy": "ppo", "value": value}
-            return action, meta
+        with self._infer_lock:
+            if self.algo == "bdq":
+                action, value = self.agent.act(obs, deterministic=True)
+                meta = {"policy": "bdq", "value": value}
+            elif self.algo == "a2c":
+                action, _, _, value = self.agent.act(obs, deterministic=True)
+                meta = {"policy": "a2c", "value": value}
+            else:
+                action, _, _, value = self.agent.act(obs, deterministic=True)
+                meta = {"policy": "ppo", "value": value}
+        return action, meta
 
-    def serve_forever(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.host, self.port))
-        server.listen(1)
-        server.settimeout(1.0)
-
-        print(f"[RL] listening on {self.host}:{self.port}, algo={self.algo}")
-
-        while not self._stop:
-            try:
-                conn, addr = server.accept()
-                conn.settimeout(1.0)
-            except socket.timeout:
-                continue
-
-            print(f"[RL] connected by {addr}")
+    def _handle_conn(self, conn, addr):
+        conn.settimeout(1.0)
+        print(f"[RL] connected by {addr}")
+        try:
             with conn:
                 buffer = b""
                 while not self._stop:
@@ -154,6 +142,28 @@ class RLServer:
                             conn.sendall((json.dumps(rsp) + "\n").encode("utf-8"))
                         except OSError:
                             break
+        finally:
+            print(f"[RL] disconnected {addr}")
+
+    def serve_forever(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.host, self.port))
+        server.listen(5)
+        server.settimeout(1.0)
+
+        print(f"[RL] listening on {self.host}:{self.port}, algo={self.algo}")
+
+        while not self._stop:
+            try:
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            threading.Thread(target=self._handle_conn, args=(conn, addr),
+                             daemon=True).start()
 
         print("[RL] server stopped")
         server.close()

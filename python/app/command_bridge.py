@@ -46,12 +46,28 @@ class CommandBridge(threading.Thread):
             self._commands.append(cmd)
 
     def enqueue_control_mode(self, mode: str):
-        """Enqueue a control-mode switch command."""
-        self.enqueue_command({"type": "set_control_mode", "mode": mode})
+        """Replace unsent commands when ownership changes.
+
+        A delayed MATLAB poll must never replay an action from the previous
+        controller after a mode switch.
+        """
+        if mode not in ("rl", "agent"):
+            raise ValueError(f"Unsupported control mode: {mode}")
+        with self._lock:
+            self._commands.clear()
+            self._commands.append({"type": "set_control_mode", "mode": mode})
 
     def enqueue_action(self, action: dict):
-        """Enqueue a full jamming action (all 4 params)."""
-        self.enqueue_command(action)
+        """Keep the newest full action until MATLAB polls again."""
+        required = {"channel_idx", "power_db", "bw_mhz", "waveform_mode"}
+        if set(action) != required:
+            raise ValueError("A full four-field action is required")
+        with self._lock:
+            self._commands = deque(
+                cmd for cmd in self._commands
+                if cmd.get("type") == "set_control_mode"
+            )
+            self._commands.append(dict(action))
 
     def stop(self):
         self._stop_event.set()

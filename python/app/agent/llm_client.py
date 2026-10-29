@@ -29,11 +29,22 @@ class LLMClient:
   2. execute_strategy("fixed", {channel_idx:4, power_db:15})  — 或 set_jamming_parameters
 
 用户说"交还给RL"时:
-  cancel_strategy() + switch_control_mode("rl")
+  cancel_strategy()
 
-## 6种干扰策略
-- fixed: 固定参数, track_busiest: 追踪最强信号, sweep: 扫描所有信道
-- track_weakest: 追踪最弱信号, alternating: 交替切换, reactive: 自适应波形
+## 4种基础干扰战术 + 扩展规则 + 3种预设策略
+- fixed(恒定): 固定信道和参数；sweep(扫频): 按channels顺序并以dwell_frames驻留
+- random(随机跳频): 在channels中随机选择下个信道并避免连续重复；target_track(目标跟踪): 根据10信道占用度及min_occupancy跟踪目标
+- 扩展规则: track_busiest、track_weakest、alternating、reactive
+- coerce(强制型): 偏高功率和宽带的预设
+- energy_save(能量节约型): 偏低功率和窄带的预设；0 dB 是最小增益，不能关闭发射
+- deception(欺骗诱导型): 波形/信道变化实验预设；不是已验证的诱骗算法
+基础干扰战术由UI策略引擎逐帧生成四元动作交给MATLAB执行；waveform_mode仅控制噪声/多音波形，不等于上述战术。
+以上三种预设持续调用当前RL服务取得候选动作，再施加类型约束；服务不可用时用规则回退。
+
+## 调用RL决策算法
+如需一次性学习型决策，可调用 call_rl_inference() 让 RL(PPO/A2C/BDQ)
+根据实时信道特征推理动作并下发；此工具会切换成 Agent 一次性控制。
+若用户要持续自主决策，执行三种预设之一。
 
 ## 原则
 - 执行操作前先简要分析，操作后汇报结果

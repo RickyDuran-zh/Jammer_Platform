@@ -1,0 +1,21 @@
+[Unit]
+Description=Jammer RL inference service (PPO/A2C/BDQ on 127.0.0.1:6001)
+Documentation=file:/opt/zh_jammer_v4/arm_port/docs/03_deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jammer
+Group=jammer
+EnvironmentFile=-/etc/jammer/jammer.env
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/zh_jammer_v4/python/rl_service
+# The RL service keeps its own environment because torch is only needed here.
+ExecStart=/opt/zh_jammer_v4/python/rl_service/.venv/bin/python -u rl_server.py --algo ${JAMMER_ALGO}
+Restart=on-failure
+RestartSec=5
+Nice=-2
+
+[Install]
+WantedBy=multi-user.target

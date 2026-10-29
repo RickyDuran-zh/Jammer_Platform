@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.workbuddy/
 .env
 .env.*
 !.env.example
@@ -18,3 +19,8 @@ logs/
 Thumbs.db
 *.mat
 checkpoints/*.pt.final
+
+# ARM port artifacts
+arm_port/.venv/
+arm_port/cpp/build/
+arm_port/**/*.status.json

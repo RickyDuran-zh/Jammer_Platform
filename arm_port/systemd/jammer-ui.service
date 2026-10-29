@@ -1,0 +1,21 @@
+[Unit]
+Description=Jammer monitoring UI (PyQt5, telemetry :5555, command bridge :5557)
+Documentation=file:/opt/zh_jammer_v4/arm_port/docs/03_deployment.md
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=jammer
+Group=jammer
+EnvironmentFile=-/etc/jammer/jammer.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=QT_QPA_PLATFORM=xcb
+WorkingDirectory=/opt/zh_jammer_v4/python/app
+ExecStart=/opt/zh_jammer_v4/python/app/.venv/bin/python -u main_window.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
